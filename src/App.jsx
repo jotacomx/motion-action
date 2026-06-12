@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useMemo, Suspense } from "react";
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree, useLoader } from "@react-three/fiber";
 import { Environment, Lightformer, Float } from "@react-three/drei";
+import SplineLoader from "@splinetool/loader";
 import { motion, AnimatePresence } from "motion/react";
 import Lenis from "lenis";
 import { Volume2, VolumeX, ArrowDown, RotateCw, MessageCircle } from "lucide-react";
@@ -103,90 +104,145 @@ function CameraRig({ scrollRef }) {
 }
 
 /* ----------------------------------------------------------------------------
-   3D — Monumento (PLACEHOLDER)
-   Troque este bloco por:  const { scene } = useGLTF('/warriors-statue.glb')
-   e renderize <primitive object={scene} /> para usar a estátua real.
+   3D — Objeto central: planeta holográfico do Spline
+   Carregado em runtime via @splinetool/loader (scene.splinecode publicado).
+   Centralizamos e escalamos para caber no lugar da antiga esfera.
 -------------------------------------------------------------------------------*/
+const SPLINE_URL =
+  "https://my.spline.design/holographicearthwithdynamiclines-Y9i7L6QR6Ihp2XG4yJYwjgUj/scene.splinecode";
+
 function Monument() {
+  const obj = useLoader(SplineLoader, SPLINE_URL);
   const ref = useRef();
+
+  // centraliza, normaliza o tamanho (~4.3) e ALIVIA os materiais pesados
+  const fitted = useMemo(() => {
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const s = 4.3 / maxDim;
+    obj.scale.setScalar(s);
+    obj.position.set(-center.x * s, -center.y * s, -center.z * s);
+
+    // Otimização: materiais "holográficos" do Spline usam transmission/clearcoat/
+    // iridescence, que são caríssimos (renderizam a cena de novo por frame).
+    // Desligamos isso e mantemos o vidro via transparência simples.
+    obj.traverse((o) => {
+      if (!o.isMesh) return;
+      o.castShadow = false;
+      o.receiveShadow = false;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach((m) => {
+        if (!m) return;
+        if ("transmission" in m && m.transmission > 0) {
+          m.transmission = 0;
+          m.thickness = 0;
+          m.transparent = true;
+          if (m.opacity >= 1) m.opacity = 0.85;
+        }
+        if ("clearcoat" in m) m.clearcoat = 0;
+        if ("iridescence" in m) m.iridescence = 0;
+        if ("sheen" in m) m.sheen = 0;
+        if ("envMapIntensity" in m) m.envMapIntensity = Math.min(m.envMapIntensity ?? 1, 1);
+        m.needsUpdate = true;
+      });
+    });
+    return obj;
+  }, [obj]);
+
   useFrame((_, delta) => {
-    if (ref.current) ref.current.rotation.y += delta * 0.08;
+    if (ref.current) ref.current.rotation.y += delta * 0.12;
   });
+
   return (
-    <Float speed={1.1} rotationIntensity={0.15} floatIntensity={0.4}>
+    <Float speed={1} rotationIntensity={0.1} floatIntensity={0.3}>
       <group ref={ref} position={[0, 0.2, 0]}>
-        {/* corpo escultural facetado, bronze escuro metálico */}
-        <mesh castShadow>
-          <icosahedronGeometry args={[1.7, 1]} />
-          <meshStandardMaterial
-            color="#1c140d"
-            metalness={1}
-            roughness={0.28}
-            emissive="#ff6400"
-            emissiveIntensity={0.12}
-            envMapIntensity={1.6}
-            flatShading
-          />
-        </mesh>
-        {/* núcleo interno (brilho de brasa) */}
-        <mesh scale={0.55}>
-          <icosahedronGeometry args={[1.7, 0]} />
-          <meshStandardMaterial
-            color="#ff6400"
-            emissive="#ff6400"
-            emissiveIntensity={1.4}
-            roughness={0.6}
-          />
-        </mesh>
-        {/* pedestal */}
-        <mesh position={[0, -2.3, 0]}>
-          <cylinderGeometry args={[2.1, 2.4, 0.5, 64]} />
-          <meshStandardMaterial color="#0d0a10" metalness={0.9} roughness={0.5} />
-        </mesh>
+        <primitive object={fitted} />
       </group>
     </Float>
   );
 }
 
-/* 3D — Poeira/brasas flutuantes */
-function Embers({ count = 900 }) {
+/* Textura suave (glint radial) para cada estrela parecer um brilho/flash */
+function makeStarTexture() {
+  const s = 64;
+  const c = document.createElement("canvas");
+  c.width = c.height = s;
+  const ctx = c.getContext("2d");
+  const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  g.addColorStop(0, "rgba(255,255,255,1)");
+  g.addColorStop(0.25, "rgba(255,255,255,0.7)");
+  g.addColorStop(0.55, "rgba(255,255,255,0.15)");
+  g.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  return new THREE.CanvasTexture(c);
+}
+
+/* 3D — Estrelas que cintilam e dão flashes sutis */
+function Embers() {
   const ref = useRef();
-  const positions = useMemo(() => {
-    const arr = new Float32Array(count * 3);
+  const colorAttr = useRef();
+  const sprite = useMemo(makeStarTexture, []);
+  // menos estrelas no mobile (custo de CPU/upload por frame)
+  const count = useMemo(
+    () => (typeof window !== "undefined" && window.innerWidth < 768 ? 220 : 500),
+    []
+  );
+
+  const { positions, colors, phases, speeds } = useMemo(() => {
+    const positions = new Float32Array(count * 3);
+    const colors = new Float32Array(count * 3);
+    const phases = new Float32Array(count);
+    const speeds = new Float32Array(count);
     for (let i = 0; i < count; i++) {
       const r = 4 + Math.random() * 7;
       const th = Math.random() * Math.PI * 2;
       const ph = Math.acos(2 * Math.random() - 1);
-      arr[i * 3] = r * Math.sin(ph) * Math.cos(th);
-      arr[i * 3 + 1] = (Math.random() - 0.5) * 12;
-      arr[i * 3 + 2] = r * Math.sin(ph) * Math.sin(th);
+      positions[i * 3] = r * Math.sin(ph) * Math.cos(th);
+      positions[i * 3 + 1] = (Math.random() - 0.5) * 12;
+      positions[i * 3 + 2] = r * Math.sin(ph) * Math.sin(th);
+      colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = 0.3;
+      phases[i] = Math.random() * Math.PI * 2;
+      speeds[i] = 0.6 + Math.random() * 2.6; // velocidades variadas → cintilar irregular
     }
-    return arr;
+    return { positions, colors, phases, speeds };
   }, [count]);
 
   useFrame((state, delta) => {
-    if (!ref.current) return;
-    ref.current.rotation.y += delta * 0.02;
-    ref.current.position.y = Math.sin(state.clock.elapsedTime * 0.2) * 0.3;
+    const t = state.clock.elapsedTime;
+    if (ref.current) {
+      ref.current.rotation.y += delta * 0.012;
+      ref.current.position.y = Math.sin(t * 0.18) * 0.22;
+    }
+    const arr = colorAttr.current?.array;
+    if (arr) {
+      for (let i = 0; i < count; i++) {
+        const tw = Math.sin(t * speeds[i] + phases[i]);
+        // brilho base sutil + picos curtos de flash (pow acentua os topos = "estalo")
+        let b = 0.18 + 0.22 * (tw * 0.5 + 0.5);
+        b += Math.pow(Math.max(tw, 0), 10) * 0.7;
+        arr[i * 3] = arr[i * 3 + 1] = arr[i * 3 + 2] = b;
+      }
+      colorAttr.current.needsUpdate = true;
+    }
   });
 
   return (
     <points ref={ref}>
       <bufferGeometry>
-        <bufferAttribute
-          attach="attributes-position"
-          count={count}
-          array={positions}
-          itemSize={3}
-        />
+        <bufferAttribute attach="attributes-position" count={count} array={positions} itemSize={3} />
+        <bufferAttribute ref={colorAttr} attach="attributes-color" count={count} array={colors} itemSize={3} />
       </bufferGeometry>
       <pointsMaterial
-        size={0.035}
-        color="#ff8a3d"
+        size={0.06}
+        map={sprite}
+        vertexColors
         transparent
-        opacity={0.7}
         sizeAttenuation
         depthWrite={false}
+        blending={THREE.AdditiveBlending}
       />
     </points>
   );
@@ -199,26 +255,26 @@ function Scene({ scrollRef }) {
       <color attach="background" args={["#06040a"]} />
       <fog attach="fog" args={["#06040a", 9, 22]} />
 
-      {/* luz-chave laranja (rim light do original) + preenchimento azul frio */}
+      {/* luz-chave dourada (rim light) + preenchimento verde da marca */}
       <ambientLight intensity={0.15} />
       <spotLight
         position={[6, 4, 4]}
         angle={0.6}
         penumbra={1}
         intensity={120}
-        color="#ff6400"
+        color="#e3c079"
         distance={30}
       />
-      <pointLight position={[-6, 1, -3]} intensity={40} color="#4b71f7" />
+      <pointLight position={[-6, 1, -3]} intensity={42} color="#2bb39a" />
       <pointLight position={[0, -4, 4]} intensity={12} color="#fff2df" />
 
       <Suspense fallback={null}>
         <Monument />
         <Embers />
-        {/* HDR procedural (sem baixar .exr) → reflexos metálicos */}
+        {/* HDR procedural (sem baixar .exr) → reflexos */}
         <Environment resolution={256}>
-          <Lightformer intensity={3} color="#ff6400" position={[5, 2, 1]} scale={[12, 12, 1]} />
-          <Lightformer intensity={1.4} color="#4b71f7" position={[-6, 1, -2]} scale={[12, 12, 1]} />
+          <Lightformer intensity={3} color="#e3c079" position={[5, 2, 1]} scale={[12, 12, 1]} />
+          <Lightformer intensity={1.4} color="#2bb39a" position={[-6, 1, -2]} scale={[12, 12, 1]} />
           <Lightformer intensity={0.7} color="#fff2df" position={[0, 6, 3]} scale={[12, 4, 1]} />
         </Environment>
       </Suspense>
@@ -363,7 +419,7 @@ function Outro() {
         whileInView={{ opacity: 1, y: 0 }}
         viewport={{ amount: 0.6 }}
         transition={{ duration: 0.9, ease: EASE, delay: 0.25 }}
-        className="mt-8 inline-flex items-center gap-3 rounded-full bg-ember px-9 py-4 font-sans text-sm font-semibold uppercase tracking-[0.18em] text-void transition-all duration-300 hover:scale-105 hover:shadow-[0_0_35px_rgba(255,100,0,0.45)]"
+        className="mt-8 inline-flex items-center gap-3 rounded-full bg-ember px-9 py-4 font-sans text-sm font-semibold uppercase tracking-[0.18em] text-void transition-all duration-300 hover:scale-105 hover:shadow-[0_0_35px_rgba(200,161,92,0.5)]"
       >
         <MessageCircle size={18} />
         Entrar em contato
@@ -502,6 +558,12 @@ export default function App() {
   const scrollRef = useRef(0); // progresso global 0..1 lido pela câmera 3D
   const lenis = useRef(null);
   const active = useActiveSection();
+  // DPR fixo e responsivo: nítido no desktop, leve no celular (retina custa caro)
+  const [dpr, setDpr] = useState(1);
+  useEffect(() => {
+    const mobile = window.matchMedia("(max-width: 768px)").matches;
+    setDpr(mobile ? 1 : Math.min(window.devicePixelRatio || 1, 1.5));
+  }, []);
 
   useEffect(() => {
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -531,7 +593,7 @@ export default function App() {
         <Canvas
           camera={{ position: [0, 1.6, 9.5], fov: 42 }}
           gl={{ antialias: true, powerPreference: "high-performance" }}
-          dpr={[1, 1.8]}
+          dpr={dpr}
         >
           <Scene scrollRef={scrollRef} />
         </Canvas>

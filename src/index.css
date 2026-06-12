@@ -8,8 +8,8 @@
   /* Paleta extraída de mongols.peachworlds.com */
   --color-void: #06040a; /* fundo quase preto */
   --color-cream: #fff2df; /* texto principal */
-  --color-ember: #ff6400; /* destaque laranja (rim light) */
-  --color-azure: #4b71f7; /* acento azul */
+  --color-ember: #c8a15c; /* acento dourado (marca Ambition) */
+  --color-azure: #0f4a42; /* verde escuro da marca Ambition */
 }
 
 :root {
